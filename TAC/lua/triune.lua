@@ -35,7 +35,7 @@ local mq                = require('mq')
 local ImGui             = require('ImGui')
 local scriptDir         = debug.getinfo(1, "S").source:match("@?(.*[/\\])") or "./"
 package.path            = scriptDir .. "?.lua;" .. package.path
-local VERSION           = '3.2'
+local VERSION           = '3.4'
 local open              = true
 -- File-backed diagnostic logger. Hooked into print() right away so every
 -- chat line from here on (core and plugins) is captured in its ring buffer;
@@ -212,6 +212,7 @@ local function sanitizeModeConfig(c)
 
     if c.assist_self_defense == nil then c.assist_self_defense = true end
     if c.assist_behind == nil then c.assist_behind = true end
+    if c.auto_group_rez == nil then c.auto_group_rez = false end
     if c.hunter_z_plane == nil then c.hunter_z_plane = 15 end
     if c.hunter_z == nil then c.hunter_z = 75 end
 
@@ -360,6 +361,7 @@ local function defaultCtrl()
         assist_at            = 98,
         assist_self_defense  = true,
         assist_behind        = true,
+        auto_group_rez       = false,
         chase                = true,
         chase_dist           = 15,
         automem              = true,
@@ -669,7 +671,8 @@ local runtime = {
     switchingSlot = 0,
     switchingSpellName = nil,
     lastDowntimeSwapAt = {},
-    interruptedSwap = nil
+    interruptedSwap = nil,
+    nextLongBuffCast = nil
 }
 
 function runtime.runCombatCategories(runners)
@@ -738,6 +741,11 @@ local pursuit = {
     nonXtarTargetId = 0,
     nonXtarEngageAt = 0,
     lastCombatFaceAt = 0,
+    stallRecoveryId = 0,
+    stallRecoveryCount = 0,
+    approachBestDist = 9e9,
+    approachLastProgressAt = 0,
+    approachRetryCount = 0,
     lastStickDist = 0,
     lastBehindStickDist = 0,
     lastFrontStickDist = 0,
@@ -7751,7 +7759,11 @@ function runtime.initPluginManager()
         if not entry then return nil end
         pm.scriptRunningCache[entry.runName] = nil -- re-poll after the toggle
         if pm.isScriptRunning(entry, true) then
-            mq.cmd('/lua stop ' .. entry.runName)
+            if entry.file == 'long_buffs_standalone.lua' then
+                mq.cmd('/longbuff stop')
+            else
+                mq.cmd('/lua stop ' .. entry.runName)
+            end
             return 'stopped'
         end
         mq.cmd('/lua run ' .. entry.runName)
@@ -15060,6 +15072,20 @@ function UI.drawSettingsTab()
         end
     end
 
+    if ImGui.CollapsingHeader('Group Resurrection', ImGuiTreeNodeFlags.None) then
+        local rezVal = ImGui.Checkbox('Auto-resurrect group members##autoGroupRez', ctrl.auto_group_rez == true)
+        if rezVal ~= (ctrl.auto_group_rez == true) then
+            ctrl.auto_group_rez = rezVal
+            runtime.saveLoadout(true)
+        end
+        if ImGui.IsItemHovered() then
+            ImGui.SetTooltip(
+                'When enabled, Triune approaches dead group members and casts a configured resurrection spell.\n'
+                .. 'Requires MQ2Rez and a memorized resurrection spell gem configured with condition "ally is Dead".\n'
+                .. 'Triune makes up to three cast attempts per corpse per session. MQ2Rez is for accepting incoming rez offers; it does not cast the spell.')
+        end
+        accent(MUTED, 'Optional dependency: MQ2Rez. Add a resurrection spell under Spell Gems and set its condition to "ally is Dead".')
+    end
 
     -- 3. Navigation & Hazard Avoidance
     if ImGui.CollapsingHeader('Navigation & Hazard Avoidance', ImGuiTreeNodeFlags.DefaultOpen) then
@@ -16520,15 +16546,18 @@ local function baseTok(token)
 end
 
 
-function runtime.setTarget(id)
+function runtime.setTarget(id, allowCorpse)
     if not id or id == 0 then return false end
     local reqTargetId = getActiveTargetRequiredCastingId()
     if reqTargetId and reqTargetId > 0 and id ~= reqTargetId then
         return false
     end
     local s = mq.TLO.Spawn(id)
-    if not s() or s.Dead() or s.Type() == 'Corpse' then return false end
-    if (s.State() or '') == 'DEAD' then return false end
+    if not s() then return false end
+    if s.Dead() or s.Type() == 'Corpse' or (s.State() or '') == 'DEAD' then
+        if not (allowCorpse == true and ctrl.auto_group_rez == true
+            and runtime.isGroupRezCorpse(id)) then return false end
+    end
     if mq.TLO.Target.ID() == id then return true end
     local wasCombat = mq.TLO.Me.Combat()
     mq.cmdf('/target id %d', id)
@@ -17204,6 +17233,7 @@ end
 
 function runtime.isHealAction(name, targetToken, entry)
     if not name or name == '' then return false end
+    if entry and entry.when == 'ally is Dead' then return true end
     local key = tostring(name) .. '|' .. tostring(targetToken or '') .. '|'
         .. tostring(entry and entry.kind or '') .. '|' .. tostring(entry and entry.when or '')
     local cached = runtime.healActionCache[key]
@@ -18603,10 +18633,52 @@ function runtime.resolveAllEnemiesTargetId(spellName, when, pct, cls, extra)
     return nil
 end
 
+function runtime.mq2RezLoaded()
+    local ok, loaded = pcall(function()
+        local rez = mq.TLO.Rez
+        if rez and rez() == 'Rez' then return true end
+        local plugin = mq.TLO.Plugin('MQ2Rez')
+        return plugin and plugin.IsLoaded and plugin.IsLoaded() == true
+    end)
+    return ok and loaded == true
+end
+
+runtime.groupRezAttempts = runtime.groupRezAttempts or {}
+runtime.groupRezMoveAt = runtime.groupRezMoveAt or 0
+runtime.groupRezMoveTargetId = runtime.groupRezMoveTargetId or 0
+runtime.groupRezNavAttempts = runtime.groupRezNavAttempts or {}
+runtime.groupRezWarnings = runtime.groupRezWarnings or {}
+
+function runtime.recordGroupRezAttempt(corpseId, spellName)
+    local attempts = runtime.groupRezAttempts[corpseId] or { count = 0 }
+    attempts.count = attempts.count + 1
+    attempts.lastAt = os.clock()
+    attempts.spell = spellName
+    runtime.groupRezAttempts[corpseId] = attempts
+    print(string.format(
+        '\ay[Triune]\ax Resurrection attempt %d/3 on group corpse #%d using "%s".',
+        attempts.count, corpseId, spellName))
+    if attempts.count >= 3 then
+        attempts.gaveUp = true
+        print(string.format(
+            '\ar[Triune]\ax Giving up on corpse #%d after three resurrection attempts.',
+            corpseId))
+    end
+end
+
 -- Resurrection support: the nearest corpse of a dead group member (or box
--- peer). Returns nil when nobody is dead.
+-- peer). Excludes corpses already attempted three times in this session.
+function runtime.isGroupRezCorpse(id)
+    if not id or id <= 0 then return false end
+    local ok, isCorpse = pcall(function()
+        local spawn = mq.TLO.Spawn(id)
+        return spawn and spawn() and (spawn.Type() == 'Corpse' or spawn.Dead() == true)
+    end)
+    return ok and isCorpse == true
+end
+
 function runtime.deadAllyCorpseId(maxDist)
-    maxDist = maxDist or 100
+    maxDist = maxDist or 2500
     local bestId, bestDist = nil, maxDist + 1
     local function consider(name)
         if not name or name == '' then return end
@@ -18615,8 +18687,18 @@ function runtime.deadAllyCorpseId(maxDist)
             if c and c() and (c.ID() or 0) > 0 then return c.ID(), c.Distance3D() or 9999 end
             return nil, nil
         end)
-        if ok and cid and dist and dist < bestDist then bestId, bestDist = cid, dist end
+        local attempts = cid and runtime.groupRezAttempts[cid]
+        if ok and cid and dist and dist < bestDist and not (attempts and attempts.count >= 3) then
+            bestId, bestDist = cid, dist
+        elseif attempts and attempts.count >= 3 and not attempts.gaveUp then
+            attempts.gaveUp = true
+            print(string.format('\ar[Triune]\ax Giving up on corpse #%d after three resurrection attempts.', cid))
+        end
     end
+    if not ctrl or ctrl.auto_group_rez ~= true or not runtime.mq2RezLoaded() then return nil end
+    local grouped = false
+    pcall(function() grouped = (mq.TLO.Group.Members() or 0) > 0 end)
+    if not grouped then return nil end
     pcall(function()
         local n = mq.TLO.Group.Members() or 0
         for i = 1, n do
@@ -18632,6 +18714,92 @@ function runtime.deadAllyCorpseId(maxDist)
         end)
     end
     return bestId
+end
+
+function runtime.prepareGroupRez()
+    if not ctrl or ctrl.auto_group_rez ~= true then return false end
+    local groupSize = 0
+    pcall(function() groupSize = tonumber(mq.TLO.Group.Members()) or 0 end)
+    if groupSize <= 0 then return false end
+
+    if not runtime.mq2RezLoaded() then
+        if not runtime.groupRezWarnings.missingPlugin then
+            runtime.groupRezWarnings.missingPlugin = true
+            print('\ar[Triune]\ax Group resurrection is enabled but MQ2Rez is not loaded. Load it with /plugin MQ2Rez.')
+        end
+        return false
+    end
+    runtime.groupRezWarnings.missingPlugin = nil
+    if isCombat() then return false end
+
+    local corpseId = runtime.deadAllyCorpseId(2500)
+    if not corpseId then
+        runtime.groupRezMoveTargetId = 0
+        return false
+    end
+
+    local rezRange = 0
+    for _, gem in ipairs(loadout.gems or {}) do
+        if gem and gem.when == 'ally is Dead' and gem.spell and gem.spell ~= '' then
+            pcall(function()
+                local spell = mq.TLO.Spell(gem.spell)
+                if spell and spell() then
+                    rezRange = math.max(rezRange, tonumber(spell.Range()) or 0)
+                end
+            end)
+        end
+    end
+    if rezRange <= 0 then
+        if not runtime.groupRezWarnings.missingSpell then
+            runtime.groupRezWarnings.missingSpell = true
+            print('\ay[Triune]\ax Group resurrection is enabled; configure a resurrection spell gem with condition "ally is Dead".')
+        end
+        return false
+    end
+    runtime.groupRezWarnings.missingSpell = nil
+
+    local distance = math.huge
+    pcall(function() distance = tonumber(mq.TLO.Spawn(corpseId).Distance3D()) or math.huge end)
+    if distance <= rezRange then
+        runtime.groupRezMoveTargetId = 0
+        runtime.groupRezNavAttempts[corpseId] = nil
+        return false
+    end
+
+    if not navLoaded() then
+        if not runtime.groupRezWarnings.missingNav then
+            runtime.groupRezWarnings.missingNav = true
+            print('\ar[Triune]\ax Cannot approach the group corpse: MQ2Nav is not loaded.')
+        end
+        return false
+    end
+    runtime.groupRezWarnings.missingNav = nil
+
+    local now = os.clock()
+    if runtime.groupRezMoveTargetId == corpseId and isMoveActive() then return true end
+    if isMoveActive() then return false end
+
+    local navAttempts = runtime.groupRezNavAttempts[corpseId] or 0
+    if navAttempts >= 3 then
+        if not runtime.groupRezWarnings[corpseId] then
+            runtime.groupRezWarnings[corpseId] = true
+            print(string.format(
+                '\ar[Triune]\ax Could not reach group corpse #%d after three navigation attempts; move closer manually.',
+                corpseId))
+        end
+        return false
+    end
+    if now - runtime.groupRezMoveAt < 5 then return false end
+
+    navAttempts = navAttempts + 1
+    runtime.groupRezNavAttempts[corpseId] = navAttempts
+    runtime.groupRezMoveAt = now
+    runtime.groupRezMoveTargetId = corpseId
+    print(string.format(
+        '\ay[Triune]\ax Approaching group corpse #%d (%d/3 navigation attempts) to cast a configured resurrection spell.',
+        corpseId, navAttempts))
+    mq.cmdf('/nav id %d distance=%d', corpseId, math.max(5, math.floor(rezRange - 5)))
+    return true
 end
 
 function runtime.anyGroupMemberId(token, when, pct, spellName, cls, extra)
@@ -19075,7 +19243,7 @@ function runtime.castGem(i, g, id)
     local hostileTarget = (orig > 0 and isHostileTarget and isHostileTarget(orig)) == true
     local keepHostile = castThroughHostileTarget(selfCast, hostileTarget, runtime.isRedirectableHeal(g.spell, g, sp))
     local needsTarget = (orig ~= id) and not keepHostile
-    if needsTarget and not runtime.setTarget(id) then return false end
+    if needsTarget and not runtime.setTarget(id, g.when == 'ally is Dead') then return false end
 
     local pauseAttack = isFD and wasAttacking
     if pauseAttack then
@@ -19116,6 +19284,10 @@ function runtime.castGem(i, g, id)
     end
     mq.cmdf('/cast "%s"', g.spell)
     runtime.lastCast[key] = os.clock()
+    if g.when == 'ally is Dead' and ctrl and ctrl.auto_group_rez == true
+        and runtime.isGroupRezCorpse(id) then
+        runtime.recordGroupRezAttempt(id, g.spell)
+    end
     if id and id > 0 and g and g.spell and g.spell ~= '' then
         runtime.npcCastCounts = runtime.npcCastCounts or {}
         runtime.npcCastCounts[id] = runtime.npcCastCounts[id] or {}
@@ -19860,7 +20032,10 @@ function runtime.processHealPriority()
                     -- before the gem-match (Spell().RankName lookups) and the
                     -- range check (Spell TLO + distance).
                     local id = (pctVal > 0) and runtime.resolveTargetId(g.target, g.cls, g.when, g.spell, pctVal, g) or nil
-                    local wanted = id and isSpawnAlive(id)
+                    local isGroupRez = g.when == 'ally is Dead' and ctrl.auto_group_rez == true
+                        and id and runtime.isGroupRezCorpse(id)
+                    local targetValid = id and (isGroupRez or isSpawnAlive(id))
+                    local wanted = targetValid
                         and runtime.conditionMet(g.when, pctVal, g.spell, id, g.cls, g.target, g)
                         and not (castTracker and castTracker.isLockedOut(g.spell, id, g.kind))
                     local assignedGem = tonumber(g.gem) or math.min(i, 12)
@@ -19876,7 +20051,7 @@ function runtime.processHealPriority()
                     end
                     if isMemmed then
                         if pctVal > 0 then
-                            if id and isSpawnAlive(id) then
+                            if targetValid then
                                 local rangeOk = (id == mq.TLO.Me.ID()) or runtime.isTargetInRange(g.spell, id)
                                 if rangeOk then
                                     if true then
@@ -19896,7 +20071,8 @@ function runtime.processHealPriority()
                                             hotUp = (tonumber(dur) or 0) > 0 and buffActive(id, g.spell) and not bardKeepSinging(g)
                                         end
                                         if ready and not throttled and not hotUp and curMana >= spMana and hasSpellReagents(g.spell) then
-                                            local targetHp = pctHP(id) or 100
+                                            -- A corpse's zero HP must not outrank a living emergency.
+                                            local targetHp = isGroupRez and 100 or (pctHP(id) or 100)
                                             eligibleHeals[#eligibleHeals + 1] = {
                                                 type = 'gem',
                                                 name = g.spell,
@@ -20045,7 +20221,10 @@ function runtime.processHealPriority()
         end
     end
 
-    if #eligibleHeals == 0 then return runtime.processGroupCureProbe() end
+    if #eligibleHeals == 0 then
+        if runtime.processGroupCureProbe() then return true end
+        return runtime.prepareGroupRez and runtime.prepareGroupRez() or false
+    end
     runtime.finishGroupCureProbe()
 
     -- Sort eligible heals:
@@ -20852,9 +21031,14 @@ function runtime.moveToward(id, dist, followOnly)
         pursuit.id = id; pursuit.bestDist = d; pursuit.improvedAt = os.clock()
         pursuit.navStalls = 0; pursuit.wasNavActive = false
         pursuit.lastLoSAt = 0
+        if pursuit.stallRecoveryId ~= id then
+            pursuit.stallRecoveryId = id
+            pursuit.stallRecoveryCount = 0
+        end
     elseif d < pursuit.bestDist - 2 or isClimbingLadder() then
         pursuit.bestDist = math.min(pursuit.bestDist, d); pursuit.improvedAt = os.clock()
         pursuit.navStalls = 0
+        pursuit.stallRecoveryCount = 0
     end
 
     local losNow = hasLoS(id)
@@ -20890,17 +21074,21 @@ function runtime.moveToward(id, dist, followOnly)
     end
 
     if (os.clock() - pursuit.improvedAt) > NAV_CONST.PURSUIT_STALL_TIMEOUT or pursuit.navStalls >= 3 then
-        if d <= effectiveArrivalDist + 12 and losOk then
-            stopMoving()
-            if not followOnly then
-                if mq.TLO.Target.ID() ~= id then runtime.setTarget(id) end
-                mq.cmd('/face fast')
-            end
-            pursuit.lastNavTargetId = 0
-            pursuit.id = 0
-            return true
-        end
         if not followOnly then
+            if pursuit.stallRecoveryId ~= id then
+                pursuit.stallRecoveryId = id
+                pursuit.stallRecoveryCount = 0
+            end
+            if pursuit.stallRecoveryCount < 1 then
+                pursuit.stallRecoveryCount = pursuit.stallRecoveryCount + 1
+                print(string.format(
+                    '\ay[Triune]\ax No approach progress on target #%d for %ds -- restarting movement once before abandoning it.',
+                    id, NAV_CONST.PURSUIT_STALL_TIMEOUT))
+                stopMoving()
+                pursuit.id = 0
+                pursuit.approachLastProgressAt = os.clock()
+                return false
+            end
             print(string.format(
                 '\ay[Triune]\ax giving up on target %d -- %s (likely elevated/blocked despite a ground path existing).',
                 id,
@@ -20987,14 +21175,21 @@ end
 -- ============================================================================
 
 local function repositionCloser()
-    if not isCombat() then return end
+    -- Range errors can occur before MQ reports combat; ctrl.running is the
+    -- authority for whether Triune should take over movement.
     -- Manual mode with Stick off: the player owns movement.
     if ctrl.mode == 'Manual' and ctrl.manual_stick == false then return end
     local tgt = mq.TLO.Target
     if not (tgt() and tgt.Type() == 'NPC' and not tgt.Dead()) then return end
     local tid = tgt.ID()
     if not ctrl.running then return end
-    if isMoveActive() then return end
+    if isMoveActive() then
+        if pursuit.lastNavTargetId == tid or
+            tostring(pursuit.lastNavTargetId) == ('native_spawn_' .. tostring(tid)) then
+            return
+        end
+        stopMoving()
+    end
     if (os.clock() - pursuit.lastTooFarRepositionAt) < 1.0 then return end
     pursuit.lastTooFarRepositionAt = os.clock()
 
@@ -21038,7 +21233,6 @@ local function repositionCloser()
 end
 
 local function handleCantHitFromHere()
-    if not isCombat() then return end
     -- Manual mode with Stick off: the player owns movement (and their target).
     if ctrl.mode == 'Manual' and ctrl.manual_stick == false then return end
     local tgt = mq.TLO.Target
@@ -23825,6 +24019,26 @@ function runtime.processDowntimeBuffing()
             end
         end
 
+        -- 2b. The optional Long-Duration Buffs plugin supplies class-book
+        -- spells and trained AA buffs through the same safe downtime path.
+        if not candidate and runtime.nextLongBuffCast then
+            local autoEntry, autoTargetId = runtime.nextLongBuffCast()
+            if autoEntry and autoTargetId and autoTargetId > 0 then
+                if autoEntry.autoBuffType == 'aa' then
+                    if runtime.isTargetInRange(autoEntry.spell, autoTargetId) then
+                        runtime.fireAA(autoEntry.name, autoEntry, autoTargetId)
+                    end
+                    return
+                end
+                if autoEntry.autoBuffType == 'spell' and autoEntry.spell and autoEntry.gem then
+                    candidate = autoEntry
+                    candidateTargetId = autoTargetId
+                    targetGem = tonumber(autoEntry.gem) or 0
+                    fixedTarget = true
+                end
+            end
+        end
+
         -- 3. If a candidate buff was found, ensure it is memorized and cast
         if candidate then
             local curSlot = nil
@@ -24107,7 +24321,8 @@ local function combatTick()
     if isCastingNow then
         castTracker.wasCasting = true
         local reqTargetId = getActiveTargetRequiredCastingId()
-        if reqTargetId and reqTargetId > 0 and isSpawnAlive(reqTargetId) then
+        if reqTargetId and reqTargetId > 0 and (isSpawnAlive(reqTargetId)
+            or (ctrl.auto_group_rez == true and runtime.isGroupRezCorpse(reqTargetId))) then
             if mq.TLO.Target.ID() ~= reqTargetId then
                 mq.cmdf('/target id %d', reqTargetId)
             end
@@ -24773,37 +24988,68 @@ local function combatTick()
             if pursuit.approachTargetId ~= tid then
                 pursuit.approachTargetId = tid
                 pursuit.approachStartedAt = os.clock()
+                pursuit.approachBestDist = distToId(tid)
+                pursuit.approachLastProgressAt = os.clock()
+                pursuit.approachRetryCount = 0
             end
             local curDist = distToId(tid)
             local inReach = (curDist <= (desiredRange(tid) + 4)) and hasLoS(tid)
             if inReach or (inCombatNow and engage and hasLoS(tid)) then
                 pursuit.approachStartedAt = os.clock()
-            elseif (os.clock() - (pursuit.approachStartedAt or os.clock())) > 15.0 then
-                print(string.format(
-                    '\ay[Triune]\ax Target #%d (%s) unreachable after 15s -- marking unreachable & moving to next NPC.',
-                    tid, tostring(mq.TLO.Target.CleanName())))
-                markUnreachable(tid)
-                stopMoving()
-                clearTarget()
-                haveNPC = false
-                engage = false
-                pursuit.id = 0
-                pursuit.approachTargetId = 0
-                pursuit.approachStartedAt = 0
-                pursuit.nonXtarTargetId = 0
-                pursuit.nonXtarEngageAt = 0
-                runtime.pullTargetId = 0
-                runtime.pullState = 'IDLE'
+                pursuit.approachBestDist = curDist
+                pursuit.approachLastProgressAt = os.clock()
+                pursuit.approachRetryCount = 0
+            elseif curDist < (pursuit.approachBestDist or 9e9) - 2 then
+                pursuit.approachBestDist = curDist
+                pursuit.approachLastProgressAt = os.clock()
+                pursuit.approachRetryCount = 0
+            elseif not isMoveActive() and not isCasting() and not runtime.combatHold()
+                and not runtime.anchorLeashed(tid)
+                and (os.clock() - (pursuit.approachLastProgressAt or os.clock())) > 15.0 then
+                if (pursuit.approachRetryCount or 0) < 2 then
+                    pursuit.approachRetryCount = (pursuit.approachRetryCount or 0) + 1
+                    pursuit.approachBestDist = curDist
+                    pursuit.approachLastProgressAt = os.clock()
+                    print(string.format(
+                        '\ay[Triune]\ax Target #%d (%s) has made no closing progress for 15s; retrying approach (%d/2).',
+                        tid, tostring(mq.TLO.Target.CleanName()), pursuit.approachRetryCount))
+                    repositionCloser()
+                else
+                    print(string.format(
+                        '\ay[Triune]\ax Target #%d (%s) remains unreachable after two approach retries; moving to another NPC.',
+                        tid, tostring(mq.TLO.Target.CleanName())))
+                    markUnreachable(tid)
+                    stopMoving()
+                    clearTarget()
+                    haveNPC = false
+                    engage = false
+                    pursuit.id = 0
+                    pursuit.approachTargetId = 0
+                    pursuit.approachStartedAt = 0
+                    pursuit.approachBestDist = 9e9
+                    pursuit.approachLastProgressAt = 0
+                    pursuit.approachRetryCount = 0
+                    pursuit.nonXtarTargetId = 0
+                    pursuit.nonXtarEngageAt = 0
+                    runtime.pullTargetId = 0
+                    runtime.pullState = 'IDLE'
+                end
             end
         else
             pursuit.approachTargetId = 0
             pursuit.approachStartedAt = 0
+            pursuit.approachBestDist = 9e9
+            pursuit.approachLastProgressAt = 0
+            pursuit.approachRetryCount = 0
             pursuit.nonXtarTargetId = 0
             pursuit.nonXtarEngageAt = 0
         end
     else
         pursuit.approachTargetId = 0
         pursuit.approachStartedAt = 0
+        pursuit.approachBestDist = 9e9
+        pursuit.approachLastProgressAt = 0
+        pursuit.approachRetryCount = 0
         pursuit.nonXtarTargetId = 0
         pursuit.nonXtarEngageAt = 0
     end
@@ -25465,6 +25711,8 @@ local function setTriuneMode(arg1, arg2)
         runtime.pullTargetId = 0
         pursuit.id = 0; pursuit.lastNavTargetId = 0; pursuit.lastNavLoc = nil; pursuit.wanderLoc = nil
         pursuit.approachTargetId = 0; pursuit.approachStartedAt = 0
+        pursuit.approachBestDist = 9e9; pursuit.approachLastProgressAt = 0; pursuit.approachRetryCount = 0
+        pursuit.stallRecoveryId = 0; pursuit.stallRecoveryCount = 0
         runtime.clearBreadcrumbs()
         if runtime.pullHpRest then runtime.pullHpRest = false end
         if runtime.medBreakActive then runtime.medBreakActive = false end

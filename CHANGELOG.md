@@ -1,5 +1,21 @@
 # Triune AutoCombat Change Log
 
+## 2026-11-04
+
+- Reconcile the cure/heal/Box Network branch with `tunaria/TriuneAutocombat` main, preserving upstream 3.4, target recovery, optional group resurrection and Long-Duration Buffs hooks alongside recipient inspection, emergency healing and cast target restoration. Retain the already-published branch history; no release or game installation is performed.
+
+- Keep emergency HP heals and pending ally inspections ahead of optional corpse navigation, permit explicit resurrection targeting/holding without allowing ordinary targeting to select corpses, and retain Long-Duration Buffs recipients through memorization and aggro interruption. Add real-path integration regressions (`TAC/lua/triune.lua`, `tests/test_pure_logic.lua`; decision record DL-006).
+
+---
+
+## 2026-11-02
+
+- **Version 3.4 carried everywhere (`README.md`, `TAC/lua/tac/hud_unitframes.lua`, `tests/test_pure_logic.lua`, `.agents/AGENTS.md`, `RELEASES.md`).** The target-recovery change (PR #1) raised `TAC/lua/triune.lua` to 3.4 but left the README at 3.2, which failed the CI version check and the version suites (75, 77, 78, 79, 81). The README, the unit-frame title fallbacks, the test suites' version checks and mocks, and the AGENTS.md examples now say 3.4, and `RELEASES.md` has the `## 3.4` entry the release workflow needs. Tag the release as `v3.4`.
+
+## 2026-10-26
+
+- **Core hooks for the optional Long-Duration Buffs plugin (`TAC/lua/triune.lua`).** Three small, inert-by-default hooks so a separate plugin (https://github.com/DeFluxStudios/Triune-Long-Buffs) can keep long class buffs up: `runtime.nextLongBuffCast` is declared on the runtime table and, when a plugin sets it, `processDowntimeBuffing()` asks it for a spell or AA buff after the normal buff-list candidates (step 2b) and sends it through the existing safe downtime path (aggro checks, temporary gem swap and restore); `pm.toggleScript` stops the plugin's standalone script through its own `/longbuff stop` bind. With no plugin installed `runtime.nextLongBuffCast` is nil and behavior is unchanged. The plugin itself uses only existing hooks (`onBetweenPulls`, `onCombatTick`, `plugin.window` header buttons, Box Network commands).
+
 ## 2026-10-17
 
 - Repair Box Network cure reports: include each character's own affliction flags when client counter totals are zero, preserve unknown reads, and expire counter data by heartbeat age rather than unrelated message traffic. Fresh same-server, same-zone peer reports drive ordered cures without inspection and release pending inspection; older zero-only reports retain the existing fallback. Add report/freshness details to `/ac net debug`. Update both `lua/triune.lua` and `lua/tac/boxnet.lua` on participating characters (`README.md`, `tests/test_pure_logic.lua`).

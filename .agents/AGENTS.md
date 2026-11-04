@@ -159,12 +159,12 @@ Rules:
 
 The canonical version is defined in `TAC/lua/triune.lua`:
 ```lua
-local VERSION           = '3.2'
+local VERSION           = '3.4'
 ```
 
 The README must always reflect this value:
 ```markdown
-Current version: **3.2**
+Current version: **3.4**
 ```
 
 When you bump the version, update `TAC/lua/triune.lua` and the `README.md`.

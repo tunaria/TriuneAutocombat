@@ -4665,7 +4665,7 @@ end
 print('--- Ordered Cure Targeting With Real Runtime Logic ---')
 do
 (function()
-    local meId, allyId, otherAllyId, mobId = 1001, 2002, 3003, 9009
+    local meId, allyId, otherAllyId, corpseId, mobId = 1001, 2002, 3003, 4004, 9009
     local world = { clock = 100, target = mobId, counters = {}, hp = {}, castMs = 2500 }
     local runtime = { healActionCache = {}, lastCast = {} }
     local ctrl = { running = true, mode = 'Assist', medbreak_enabled = false }
@@ -4715,16 +4715,17 @@ do
     addSpell('Self Armor', {}, 'Self', true, 60)
     addSpell('AE Armor', {}, 'PB AE', true, 60)
     addSpell('Ordered Friendly AA', {}, 'Self', true, 60)
+    addSpell('Resurrection', {}, 'Corpse')
 
     local function counter(id, key)
         return (world.counters[id] and world.counters[id][key]) or 0
     end
     local spawns = {}
-    for _, id in ipairs({ meId, allyId, otherAllyId, mobId }) do
+    for _, id in ipairs({ meId, allyId, otherAllyId, corpseId, mobId }) do
         spawns[id] = callable({
             ID = function() return id end,
             CleanName = function() return 'Character' .. id end,
-            Type = function() return id == mobId and 'NPC' or 'PC' end,
+            Type = function() return id == mobId and 'NPC' or id == corpseId and 'Corpse' or 'PC' end,
             State = function() return 'STAND' end,
             Dead = function() return world.dead[id] == true end,
             Present = function() return world.absent[id] ~= true end,
@@ -4852,6 +4853,9 @@ do
                 end,
             }, function() return world.target > 0 and 'Target' or nil end),
             Spawn = function(id)
+                if id == 'pccorpse Character' .. otherAllyId then
+                    return world.dead[otherAllyId] and spawns[corpseId] or callable({}, no)
+                end
                 if type(id) == 'string' then id = tonumber(id:match('^pc =Character(%d+)$')) or id end
                 return spawns[id] or callable({}, no)
             end,
@@ -4871,6 +4875,7 @@ do
             end,
             AltAbility = aa,
             Window = function() return { Open = no } end,
+            Plugin = function() return { IsLoaded = function() return world.rezLoaded == true end } end,
         },
         doevents = noop,
         delay = function(ms)
@@ -4887,6 +4892,8 @@ do
             world.target = 0
         elseif command == '/attack on' then
             world.attacking = true
+        elseif command:find('^/nav id ') then
+            world.navCommands, world.moving = world.navCommands + 1, true
         elseif command:find('^/useitem ') or command:find('^/cast ') or command:find('^/alt act ') then
             world.firedTarget = world.target
             world.firedCommand = command
@@ -4902,7 +4909,9 @@ do
         os = setmetatable({ clock = function() return world.clock end }, { __index = os }),
         print = function(message) world.messages[#world.messages + 1] = message end,
         clearCursor = noop, updatePetTracking = noop,
-        isSitting = no, isDucking = no, isMoveActive = no, navLoaded = no, stickLoaded = no,
+        isSitting = no, isDucking = no, stickLoaded = no,
+        isMoveActive = function() return world.moving == true end,
+        navLoaded = function() return world.navLoaded == true end,
         isHostileTarget = function(id) return id == mobId end,
         isSpawnAlive = function(id) return spawns[id] ~= nil and not world.dead[id] end,
         isIgnored = no, isSpawnMyPet = no, isAnyPet = no,
@@ -4978,6 +4987,11 @@ do
     runtime.isGroupCureProbeReady = real('isGroupCureProbeReady')
     runtime.finishGroupCureProbe = real('finishGroupCureProbe')
     runtime.processGroupCureProbe = real('processGroupCureProbe')
+    runtime.mq2RezLoaded = real('mq2RezLoaded')
+    runtime.recordGroupRezAttempt = real('recordGroupRezAttempt')
+    runtime.isGroupRezCorpse = real('isGroupRezCorpse')
+    runtime.deadAllyCorpseId = real('deadAllyCorpseId')
+    runtime.prepareGroupRez = real('prepareGroupRez')
     runtime.anyGroupMemberId = real('anyGroupMemberId')
     runtime.resolveTargetId = real('resolveTargetId')
     runtime.stopMovementForCast, runtime.noteAAEffectStarted = noop, noop
@@ -5023,6 +5037,7 @@ do
         world.hostileAvailable, world.afterPriority = false, 0
         ctrl.mode, ctrl.submode, ctrl.manual_auto_xtarget = 'Assist', 'Chase', true
         ctrl.downtime_buffing, ctrl.min_mana_pct = true, 0
+        ctrl.auto_group_rez = false
         ctrl.buff_refresh_sec = 45
         world.castMs = castMs == nil and 2500 or castMs
         world.casting, world.firedTarget, world.firedCommand, world.onDelay = nil, nil, nil, nil
@@ -5035,6 +5050,10 @@ do
         runtime.nextGroupCureWarningAt = nil
         runtime.pendingDowntimeReady, runtime.interruptedSwap, runtime.lastDowntimeSwapAt = nil, nil, nil
         runtime.boxBuffRequests = {}
+        runtime.groupRezAttempts, runtime.groupRezNavAttempts, runtime.groupRezWarnings = {}, {}, {}
+        runtime.groupRezMoveAt, runtime.groupRezMoveTargetId = 0, 0
+        runtime.nextLongBuffCast = nil
+        world.rezLoaded, world.navLoaded, world.moving, world.navCommands = false, false, false, 0
         runtime.lastAggroSwitchAt = nil
         tracker.activeSpell, tracker.activeTargetId, tracker.activeKind, tracker.targetRequired = nil, nil, nil, nil
         tracker.wasCasting, tracker.failed, tracker.castStartTime = false, false, 0
@@ -6129,6 +6148,94 @@ do
         assert_eq(world.firedTarget, mobId, selector .. ': emergency self-heal retains hostile redirection')
         assert_nil(runtime.groupCureProbe, selector .. ': network buff detection never delays emergency healing')
         pair.close()
+    end
+
+    -- DL-006: integrate upstream resurrection without bypassing emergency heals
+    -- or the existing pending-inspection hold.
+    local rez = { spell = 'Resurrection', target = 'F: Group, then Me',
+        when = 'ally is Dead', pct = 100, cls = 'Clr', gem = 1 }
+    local function prepareRez(distance)
+        reset(emergencyHeal)
+        ctrl.auto_group_rez, world.rezLoaded, world.navLoaded = true, true, true
+        world.inCombat, world.groupSize = false, 2
+        world.dead[otherAllyId], world.dead[corpseId] = true, true
+        world.hp[corpseId], world.distances[corpseId] = 0, distance
+        loadout.gems = { rez }
+    end
+    for _, distance in ipairs({ 20, 200 }) do
+        prepareRez(distance)
+        world.hp[meId] = 30
+        assert_true(runtime.processHealPriority(), 'DL-006: an emergency heal dispatches with a group corpse available')
+        assert_eq(tracker.activeSpell, emergencyHeal.spell, 'DL-006: living HP heals precede resurrection casts and navigation')
+        assert_eq(world.navCommands, 0, 'DL-006: no corpse navigation starts before the emergency heal')
+        assert_nil(runtime.groupRezAttempts[corpseId], 'DL-006: emergency healing does not spend a resurrection attempt')
+    end
+    prepareRez(200)
+    loadout.clickies = {}
+    assert_true(runtime.processHealPriority(), 'DL-006: optional corpse navigation still runs when no heal or inspection needs the tick')
+    assert_eq(world.navCommands, 1, 'DL-006: the real upstream preparation issues corpse navigation')
+    assert_eq(runtime.groupRezNavAttempts[corpseId], 1, 'DL-006: upstream navigation-attempt accounting is preserved')
+
+    prepareRez(20)
+    loadout.clickies = {}
+    assert_eq(runtime.setTarget(corpseId), false, 'DL-006: ordinary automatic targeting still refuses corpses')
+    for attempt = 1, 3 do
+        assert_true(runtime.processHealPriority(), 'DL-006: an in-range corpse can receive its configured resurrection gem')
+        assert_eq(tracker.activeSpell, rez.spell, 'DL-006: the real priority engine casts the resurrection spell')
+        assert_eq(runtime.groupRezAttempts[corpseId] and runtime.groupRezAttempts[corpseId].count, attempt,
+            'DL-006: actual resurrection commands count toward the upstream limit')
+        if world.firedCommand then checkHeldAndRestored(corpseId, 'DL-006 resurrection ' .. attempt) end
+    end
+    assert_nil(runtime.deadAllyCorpseId(), 'DL-006: three resurrection attempts exclude that corpse')
+    assert_eq(runtime.processHealPriority(), false, 'DL-006: exhausted resurrection attempts cannot spin/recast')
+    prepareRez(200)
+    ctrl.auto_group_rez, loadout.clickies = false, {}
+    assert_eq(runtime.processHealPriority(), false, 'DL-006: upstream resurrection remains disabled by default')
+    assert_eq(world.navCommands, 0, 'DL-006: disabled resurrection never drives navigation')
+    assert_eq(runtime.setTarget(corpseId, true), false, 'DL-006: disabled resurrection cannot opt into corpse targeting')
+
+    prepareRez(200)
+    local inspectCure = { name = 'Inspection Cure', spell = 'Cure Curse', target = 'F: Group, then Me',
+        when = 'has Curse', pct = 100, cls = 'Clr' }
+    loadout.clickies, world.itemSpell = { inspectCure, emergencyHeal }, inspectCure.spell
+    world.feed, world.cacheDelay = false, 10
+    runtime.resolveTargetId(inspectCure.target, 'ALL', inspectCure.when, inspectCure.spell, 100, inspectCure)
+    assert_true(runtime.processGroupCureProbe(), 'DL-006: the real probe begins delayed ally inspection')
+    assert_true(runtime.processHealPriority(), 'DL-006: an active inspection retains the tick before optional resurrection')
+    assert_eq(world.target, allyId, 'DL-006: delayed inspection retains its living ally target')
+    assert_eq(world.navCommands, 0, 'DL-006: resurrection navigation does not run during pending inspection')
+    world.hp[meId], world.itemSpell = 30, emergencyHeal.spell
+    assert_true(runtime.processHealPriority(), 'DL-006: emergency healing still preempts an active probe with resurrection enabled')
+    assert_eq(tracker.activeSpell, emergencyHeal.spell, 'DL-006: pending inspection and optional rez cannot block emergency HP healing')
+    assert_nil(runtime.groupCureProbe, 'DL-006: emergency dispatch cancels the pending probe through its normal cleanup')
+
+    -- DL-006: a plugin's explicit recipient survives the existing safe downtime
+    -- swap, just like a Box Network buff request, even with an ordered token.
+    for _, interrupted in ipairs({ false, true }) do
+        local entry = { spell = 'Armor of Faith', target = 'F: Me, then Group', when = 'missing buff',
+            pct = 100, cls = 'Clr', gem = 1, autoBuffType = 'spell' }
+        configureFriendly('gem', entry)
+        loadout.gems = {}
+        world.inCombat, world.memmed, world.spellReady, world.groupSize = false, false, false, 2
+        knownGroupBuffs(false)
+        runtime.nextLongBuffCast = function() return entry, otherAllyId end
+        runtime.processDowntimeBuffing()
+        assert_eq(world.memCalls, 1, 'DL-006: the optional long-buff supplier uses the existing gem-swap path')
+        assert_true(runtime.pendingDowntimeReady and runtime.pendingDowntimeReady.fixedTarget,
+            'DL-006: a plugin-supplied recipient is fixed through memorization')
+        if interrupted then
+            world.inCombat = true
+            runtime.tickPendingDowntimeReady()
+            assert_true(runtime.interruptedSwap and runtime.interruptedSwap.fixedTarget,
+                'DL-006: aggro interruption retains the optional plugin recipient')
+            assert_nil(world.firedCommand, 'DL-006: downtime aggro still cancels the pending buff cast')
+            world.inCombat = false
+            runtime.processDowntimeBuffing()
+        else
+            runtime.tickPendingDowntimeReady()
+        end
+        assert_eq(world.firedTarget, otherAllyId, 'DL-006: the long-buff supplier recipient is not replaced by an ordered re-selection')
+        if world.firedCommand then checkHeldAndRestored(otherAllyId, 'DL-006 optional long buff') end
     end
 
     local loopSource = extractFunction(src, 'runMainLoop')
@@ -10057,8 +10164,8 @@ do
     -- 9. Verify version sync
     local vTriune = triuneContent:match("local VERSION%s*=%s*'(.-)'")
     local vReadme = readmeContent:match("Current version:%s*%*%*(.-)%*%*")
-    assert_eq(vTriune, '3.2', 'Suite 77: triune.lua VERSION is 3.2')
-    assert_eq(vReadme, '3.2', 'Suite 77: README.md version is 3.2')
+    assert_eq(vTriune, '3.4', 'Suite 77: triune.lua VERSION is 3.4')
+    assert_eq(vReadme, '3.4', 'Suite 77: README.md version is 3.4')
     assert_eq(vTriune, vReadme, 'Suite 77: Version numbers match across triune.lua and README.md')
 end
 
@@ -10173,8 +10280,8 @@ do
     -- 6. Verify version sync
     local vTriune = triuneContent:match("local VERSION%s*=%s*'(.-)'")
     local vReadme = readmeContent:match("Current version:%s*%*%*(.-)%*%*")
-    assert_eq(vTriune, '3.2', 'Suite 78: triune.lua VERSION is 3.2')
-    assert_eq(vReadme, '3.2', 'Suite 78: README.md version is 3.2')
+    assert_eq(vTriune, '3.4', 'Suite 78: triune.lua VERSION is 3.4')
+    assert_eq(vReadme, '3.4', 'Suite 78: README.md version is 3.4')
     assert_eq(vTriune, vReadme, 'Suite 78: Version numbers match across triune.lua and README.md')
 end
 
@@ -10335,8 +10442,8 @@ do
     -- 9. Verify version sync
     local vTriune = triuneContent:match("local VERSION%s*=%s*'(.-)'")
     local vReadme = readmeContent:match("Current version:%s*%*%*(.-)%*%*")
-    assert_eq(vTriune, '3.2', 'Suite 79: triune.lua VERSION is 3.2')
-    assert_eq(vReadme, '3.2', 'Suite 79: README.md version is 3.2')
+    assert_eq(vTriune, '3.4', 'Suite 79: triune.lua VERSION is 3.4')
+    assert_eq(vReadme, '3.4', 'Suite 79: README.md version is 3.4')
     assert_eq(vTriune, vReadme, 'Suite 79: Version numbers match across triune.lua and README.md')
 end
 
@@ -10522,8 +10629,8 @@ do
     -- 7. Verify version sync
     local vTriune = triuneContent:match("local VERSION%s*=%s*'(.-)'")
     local vReadme = readmeContent:match("Current version:%s*%*%*(.-)%*%*")
-    assert_eq(vTriune, '3.2', 'Suite 81: triune.lua VERSION is 3.2')
-    assert_eq(vReadme, '3.2', 'Suite 81: README.md version is 3.2')
+    assert_eq(vTriune, '3.4', 'Suite 81: triune.lua VERSION is 3.4')
+    assert_eq(vReadme, '3.4', 'Suite 81: README.md version is 3.4')
     assert_eq(vTriune, vReadme, 'Suite 81: Version numbers match across triune.lua and README.md')
 end
 
@@ -11212,7 +11319,7 @@ do
     -- Test lifecycle with mock core API
     local mockCore = {
         ctrl = { show_unit_frames = true, uf_lock = false, uf_alpha = 0.85 },
-        VERSION = '3.2',
+        VERSION = '3.4',
         mq = {
             TLO = {
                 Me = {
@@ -11437,7 +11544,7 @@ do
         mq = mockMq,
         ImGui = mockImGui,
         UI = mockUI,
-        VERSION = '3.2',
+        VERSION = '3.4',
         DATA = {},
         loadout = {},
         scriptDir = './',
@@ -11743,7 +11850,7 @@ do
             },
         }
         local core = {
-            VERSION = '3.2', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
+            VERSION = '3.4', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
             colors = { GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 } },
             px = function(n) return n end, pushTheme = noop, popTheme = noop, accent = noop, setTooltip = noop,
             preBeginWindow = noop, postBeginWindow = noop,
@@ -12108,7 +12215,7 @@ do
             UI = { accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop, preBeginWindow = noop, postBeginWindow = noop,
                    drawStatusProgressBar = noop, drawSpellIcon = function() return false end,
                    getConColorRgb = function() return { 1, 1, 1, 1 } end, resolveTargetOfTarget = function() return nil end },
-            VERSION = '3.2', DATA = {}, loadout = {}, scriptDir = './',
+            VERSION = '3.4', DATA = {}, loadout = {}, scriptDir = './',
             GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 },
             saveLoadout = noop, print = quietPrint,
             idxOf = function() return 0 end, fmtSec = tostring, parseDurationSec = function() return 0 end,
@@ -12361,7 +12468,7 @@ do
         ctrl = { auto_summon_fireworks = true, auto_spend_aa_id = 17788, plugins = {} }, mq = mq,
         ImGui = setmetatable({}, { __index = function() return noop end }),
         runtime = { isCasting = function() return false end, cachedAAData = {} },
-        DATA = {}, colors = {}, accent = noop, saveLoadout = noop, VERSION = '3.2',
+        DATA = {}, colors = {}, accent = noop, saveLoadout = noop, VERSION = '3.4',
     }
     local origPrint = print
     print = quietPrint
@@ -12496,7 +12603,7 @@ do
                 ['Alternately Advanced Fireworks'] = { cost = 25, rank = 0, maxRank = 1, category = 'Special' },
             },
         },
-        DATA = {}, colors = {}, accent = noop, saveLoadout = noop, VERSION = '3.2',
+        DATA = {}, colors = {}, accent = noop, saveLoadout = noop, VERSION = '3.4',
     }
     local origPrint = print
     print = quietPrint
@@ -13043,7 +13150,7 @@ do
         UI = { accent = noop, setTooltip = noop, pushTheme = noop, popTheme = noop, preBeginWindow = noop, postBeginWindow = noop,
                drawStatusProgressBar = noop, drawSpellIcon = function() return false end,
                getConColorRgb = function() return { 1, 1, 1, 1 } end, resolveTargetOfTarget = function() return nil end },
-        VERSION = '3.2', DATA = {}, loadout = {}, scriptDir = './',
+        VERSION = '3.4', DATA = {}, loadout = {}, scriptDir = './',
         GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 },
         saveLoadout = noop, print = quietPrint,
         idxOf = function() return 0 end, fmtSec = tostring, parseDurationSec = function() return 0 end,
@@ -13481,7 +13588,7 @@ end
             },
         }
         local core = setmetatable({
-            mq = mq, ImGui = mockImGui, runtime = { pullState = 'IDLE' }, VERSION = '3.2',
+            mq = mq, ImGui = mockImGui, runtime = { pullState = 'IDLE' }, VERSION = '3.4',
             colors = {}, saveLoadout = function() box.saves = box.saves + 1 end,
             px = function(n) return n end, pushTheme = noop, popTheme = noop, accent = noop, setTooltip = noop,
             preBeginWindow = noop, postBeginWindow = noop,
@@ -14312,7 +14419,7 @@ end)()
         },
     }
     local core = setmetatable({
-        mq = mq, ImGui = mockImGui, runtime = {}, VERSION = '3.2', colors = {},
+        mq = mq, ImGui = mockImGui, runtime = {}, VERSION = '3.4', colors = {},
         saveLoadout = function() saves = saves + 1 end,
         px = function(n) return n end, pushTheme = noop, popTheme = noop, accent = noop, setTooltip = noop,
         preBeginWindow = noop, postBeginWindow = noop,
@@ -15673,7 +15780,7 @@ end)()
         SameLine = function(x) if x then S.imgui.lastSameLineX = x end end,
     }, { __index = function() return function() end end })
     local core = setmetatable({
-        VERSION = '3.2', ctrl = { plugins = {}, show_dps = true }, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
+        VERSION = '3.4', ctrl = { plugins = {}, show_dps = true }, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
         px = function(n) return n end, colors = {}, pushTheme = function() end, popTheme = function() end, accent = function() end, setTooltip = function() end,
         preBeginWindow = function() end, postBeginWindow = function() end, saveLoadout = function() end,
         drawStatusProgressBar = function(frac, w, h, label, r, g, b) S.imgui.bars = (S.imgui.bars or 0) + 1 S.lastBar = { frac = frac, label = label, r = r, g = g, b = b } texts[#texts + 1] = tostring(label) end,
@@ -15916,7 +16023,7 @@ end)()
     }
     local UI = {}
     local env = setmetatable({
-        ctrl = ctrl, runtime = runtime, mq = mq, ImGui = mockImGui, UI = UI, VERSION = '3.2', open = true,
+        ctrl = ctrl, runtime = runtime, mq = mq, ImGui = mockImGui, UI = UI, VERSION = '3.4', open = true,
         GOLD = { 1, 0.7, 0.54, 1 }, ARC = { 0.3, 0.7, 1, 1 }, MUTED = { 0.49, 0.56, 0.65, 1 }, GOOD = { 0.37, 0.88, 0.64, 1 }, WARN = { 1, 0.72, 0.3, 1 },
         accent = function(c, txt) mockImGui.TextColored(c[1], c[2], c[3], c[4], txt) end,
         idxOf = loadFunc(src, 'idxOf', {}),
@@ -19451,7 +19558,7 @@ do
         }
         local ctrl = { plugins = {}, show_inv = true }
         local core = {
-            VERSION = '3.2', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
+            VERSION = '3.4', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
             colors = { GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 } },
             px = function(n) return n end, pushTheme = noop, popTheme = noop, accent = noop, setTooltip = noop,
             preBeginWindow = noop, postBeginWindow = noop,
@@ -19956,7 +20063,7 @@ do
         }
         local ctrl = { plugins = {} }
         local core = {
-            VERSION = '3.2', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
+            VERSION = '3.4', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
             colors = { GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 } },
             px = function(n) return n end, pushTheme = noop, popTheme = noop, accent = noop, setTooltip = noop,
             preBeginWindow = noop, postBeginWindow = noop,
@@ -21442,7 +21549,7 @@ do
         }
         local ctrl = { plugins = {} }
         local core = {
-            VERSION = '3.2', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
+            VERSION = '3.4', ctrl = ctrl, mq = mq, ImGui = mockImGui, runtime = {}, DATA = {},
             colors = { GOLD = { 1, 1, 1, 1 }, ARC = { 1, 1, 1, 1 }, MUTED = { 1, 1, 1, 1 }, GOOD = { 1, 1, 1, 1 }, WARN = { 1, 1, 1, 1 }, ERR = { 1, 1, 1, 1 } },
             px = function(n) return n end, pushTheme = noop, popTheme = noop, accent = noop, setTooltip = noop,
             preBeginWindow = noop, postBeginWindow = noop,

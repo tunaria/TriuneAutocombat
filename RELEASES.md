@@ -4,6 +4,22 @@ Short, human-readable notes for each release. The GitHub release page is built
 from the entry that matches the tag (`v3.0` -> `## 3.0`). The full, detailed
 history of every change stays in [CHANGELOG.md](CHANGELOG.md).
 
+## 3.4
+
+Target recovery, optional group resurrection and core hooks for the Long-Duration
+Buffs plugin. Drop-in update from 3.2 (there was no 3.3 release).
+
+- **Target recovery:** approach progress is tracked, movement is retried a bounded
+  number of times, and a target is marked unreachable only after progress stalls.
+  The oversized arrival-distance fallback is gone, and range-error recovery can
+  start before MacroQuest reports combat.
+- **Group resurrection (off by default):** uses the configured `ally is Dead` spell
+  gems, MQ2Rez detection and corpse navigation, with at most three cast attempts
+  per corpse.
+- **Long-Duration Buffs hooks:** `runtime.nextLongBuffCast` lets the separate
+  plugin (https://github.com/DeFluxStudios/Triune-Long-Buffs) add a buff to the
+  safe downtime buff path; with no plugin installed nothing changes.
+
 ## 3.2
 
 A fix-and-hardening release from a full code review, plus one new (opt-in)
