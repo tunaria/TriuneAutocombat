@@ -4,6 +4,17 @@ Short, human-readable notes for each release. The GitHub release page is built
 from the entry that matches the tag (`v3.0` -> `## 3.0`). The full, detailed
 history of every change stays in [CHANGELOG.md](CHANGELOG.md).
 
+## 3.5
+
+Cure and buff targeting fixes, and rebuilt navigation meshes for the LDoN adventure zones.
+Drop-in update from 3.4.
+
+- **Ordered cures and Box Network buffs:** ordered friendly heals, cures and group buffs
+  use Box Network reports and target the right group member (dtarjeft).
+- **LDoN navmeshes:** the 48 LDoN adventure zone meshes are rebuilt to cover far more of
+  the walkable floor, with links across the narrow Deepest Guk ramps (DeFluxStudios).
+- **Everfrost:** the path up to the snowy mine works again (DeFluxStudios).
+
 ## 3.4
 
 Target recovery, optional group resurrection and core hooks for the Long-Duration

@@ -189,6 +189,6 @@ A plugin is one Lua file in `lua/tac/` that returns a table with an `id`, a `nam
 
 ## Version
 
-Current version: **3.4**
+Current version: **3.5**
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
