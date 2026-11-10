@@ -1,5 +1,14 @@
 # Triune AutoCombat Change Log
 
+## 2026-11-08
+
+- **Rebuilt the 48 LDoN adventure zone navmeshes (`TAC/resources/MQ2Nav/`: `guka`-`gukh`, `mira`-`mirj`, `mmca`-`mmcj`, `ruja`-`rujj`, `taka`-`takj`).** The old meshes left 5 to 29 percent of each zone's walkable floor uncovered and sat 0.2 to 0.5 units above it, so paths stopped short of walls, narrow doorways and some rooms. The new ones cover far more of the floor and follow it closely.
+  - Settings: agent radius 1.5 (was 2), cell size 0.3 (was 0.6), cell height 0.1 (was 0.3); height 6, climb 4, slope 75 and tile size 128 are unchanged. `rujc` and `rujf` use cell height 0.15, because Recast cannot hold their full height at 0.1 and drops the upper floors.
+  - Results, measured against each zone's own collision triangles: uncovered floor down to 1 to 9 percent, height above the floor down to 0.0 to 0.2 units (median). No zone got worse.
+  - Five Deepest Guk zones (`guka`, `gukb`, `gukd`, `gukf`, `gukh`) get two-way links across the same narrow ramp piece, which the mesh could not cross. In `gukh` that left the lower half of the zone cut off, so a character there found "no path back". The links in `gukg` and `mirb`, and the marked area in `takf`, are carried over.
+  - Each file is two to three times larger. Not yet tested in game.
+- **Fixed the Everfrost path up to the snowy mine (`TAC/resources/MQ2Nav/everfrost.navmesh`).** The stock MQ2Nav generator skips `everfrost_2_obj.s3d`, which holds the ramp and mound in front of the mine (MIRPORTAL701), so the old mesh ran paths through that model and characters got stuck there on the way to the Miragul snowy mine. This mesh has those 9 tiles rebuilt from the real model, with the zone's original settings; the other 5,031 tiles are unchanged. Tested in game on 2026-11-03: the LDoN runner reached the mine.
+
 ## 2026-11-04
 
 - Reconcile the cure/heal/Box Network branch with `tunaria/TriuneAutocombat` main, preserving upstream 3.4, target recovery, optional group resurrection and Long-Duration Buffs hooks alongside recipient inspection, emergency healing and cast target restoration. Retain the already-published branch history; no release or game installation is performed.
